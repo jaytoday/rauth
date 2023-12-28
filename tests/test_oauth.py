@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 '''
     rauth.test_oauth
     ------------------
@@ -8,139 +9,120 @@
 from base import RauthTestCase
 from rauth.oauth import (HmacSha1Signature, RsaSha1Signature,
                          PlaintextSignature)
+from rauth.utils import FORM_URLENCODED
 
-from urllib import urlencode
+# HACK: give a more informative error message if we're missing deps here
+try:
+    from Crypto.PublicKey import RSA
+except ImportError:
+    raise RuntimeError('PyCrypto is required to run the rauth test suite')
+
+try:
+    stringtype = unicode  # python 2
+except NameError:
+    stringtype = str  # python 3
+
+assert RSA
 
 
 class OAuthTestHmacSha1Case(RauthTestCase):
+    consumer_secret = '456'
+    access_token_secret = '654'
+    method = 'GET'
+    url = 'http://example.com/'
+    oauth_params = {}
+    req_kwargs = {'params': {'foo': 'bar'}}
+
     def test_hmacsha1_signature(self):
-        self.request.params = {'foo': 'bar'}
-        oauth_signature = HmacSha1Signature().sign(self.request,
-                                                   self.hook.consumer_key,
-                                                   self.hook.access_token)
+        oauth_signature = HmacSha1Signature().sign(self.consumer_secret,
+                                                   self.access_token_secret,
+                                                   self.method,
+                                                   self.url,
+                                                   self.oauth_params,
+                                                   self.req_kwargs)
         self.assertIsNotNone(oauth_signature)
-        self.assertTrue(isinstance(oauth_signature, str))
+        self.assertIsInstance(oauth_signature, stringtype)
+        self.assertEqual(oauth_signature, 'cYzjVXCOk62KoYmJ+iCvcAcgfp8=')
 
     def test_normalize_request_parameters_params(self):
         # params as a dict
-        self.request.params = {'foo': 'bar'}
-        normalized = \
-            HmacSha1Signature()._normalize_request_parameters(self.request)
+        normalized = HmacSha1Signature()\
+            ._normalize_request_parameters(self.oauth_params, self.req_kwargs)
         self.assertEqual('foo=bar',  normalized)
 
         # params as a dict with URL encodable chars
-        self.request.params_and_data = {}
-        self.request.params = {'foo+bar': 'baz'}
-        normalized = \
-            HmacSha1Signature()._normalize_request_parameters(self.request)
+        normalized = HmacSha1Signature()\
+            ._normalize_request_parameters(self.oauth_params,
+                                           {'params': {'foo+bar': 'baz'}})
         self.assertEqual('foo%2Bbar=baz',  normalized)
-        self.assertTrue('+' not in normalized)
-
-        # params as a string
-        self.request.params_and_data = {}
-        self.request.params = urlencode({'foo': 'bar'})
-        normalized = \
-            HmacSha1Signature()._normalize_request_parameters(self.request)
-        self.assertEqual('foo=bar',  normalized)
-
-        # params as a string with URL encodable chars
-        self.request.params_and_data = {}
-        self.request.params = urlencode({'foo+bar': 'baz'})
-        normalized = \
-            HmacSha1Signature()._normalize_request_parameters(self.request)
-        self.assertEqual('foo%2Bbar=baz',  normalized)
-        self.assertTrue('+' not in normalized)
+        self.assertNotIn('+', normalized)
 
         # params and dict as dicts
-        self.request.params_and_data = {}
-        self.request.params = {'a': 'b'}
-        self.request.data = {'foo': 'bar'}
-        self.request.headers = \
-            {'Content-Type': 'application/x-www-form-urlencoded'}
-        normalized = \
-            HmacSha1Signature()._normalize_request_parameters(self.request)
+        req_kwargs = {'params': {'a': 'b'},
+                      'data': {'foo': 'bar'},
+                      'headers': {'Content-Type': FORM_URLENCODED}}
+
+        normalized = HmacSha1Signature()\
+            ._normalize_request_parameters({}, req_kwargs)
         self.assertEqual('a=b&foo=bar',  normalized)
 
     def test_normalize_request_parameters_data(self):
         # data as a dict
-        self.request.data = {'foo': 'bar'}
-        self.request.headers = \
-            {'Content-Type': 'application/x-www-form-urlencoded'}
-        normalized = \
-            HmacSha1Signature()._normalize_request_parameters(self.request)
+        req_kwargs = {'data': {'foo': 'bar'},
+                      'headers': {'Content-Type': FORM_URLENCODED}}
+        normalized = HmacSha1Signature()\
+            ._normalize_request_parameters(self.oauth_params, req_kwargs)
         self.assertEqual('foo=bar',  normalized)
 
         # data as a dict with URL encodable chars
-        self.request.params_and_data = {}
-        self.request.data = {'foo+bar': 'baz'}
-        self.request.headers = \
-            {'Content-Type': 'application/x-www-form-urlencoded'}
-        normalized = \
-            HmacSha1Signature()._normalize_request_parameters(self.request)
+        req_kwargs = {'data': {'foo+bar': 'baz'},
+                      'headers': {'Content-Type': FORM_URLENCODED}}
+        normalized = HmacSha1Signature()\
+            ._normalize_request_parameters({}, req_kwargs)
         self.assertEqual('foo%2Bbar=baz',  normalized)
-        self.assertTrue('+' not in normalized)
+        self.assertNotIn('+', normalized)
 
-        # data as a string with URL encodable chars
-        self.request.data = urlencode({'foo+bar': 'baz'})
-        self.request.headers = \
-            {'Content-Type': 'application/x-www-form-urlencoded'}
-        normalized = \
-            HmacSha1Signature()._normalize_request_parameters(self.request)
+        normalized = HmacSha1Signature()\
+            ._normalize_request_parameters(self.oauth_params, req_kwargs)
         self.assertEqual('foo%2Bbar=baz',  normalized)
-        self.assertTrue('+' not in normalized)
-
-    def test_normalize_request_parameters_both_string(self):
-        # params and data both as a string
-        self.request.params = urlencode({'a': 'b'})
-        self.request.data = urlencode({'foo': 'bar'})
-        self.request.headers = \
-            {'Content-Type': 'application/x-www-form-urlencoded'}
-        normalized = \
-            HmacSha1Signature()._normalize_request_parameters(self.request)
-        # this also demonstrates sorting
-        self.assertEqual('a=b&foo=bar',  normalized)
-
-    def test_normalize_request_parameters_params_string(self):
-        # params is a string but data is a dict
-        self.request.params = urlencode({'a': 'b'})
-        self.request.data = {'foo': 'bar'}
-        self.request.headers = \
-            {'Content-Type': 'application/x-www-form-urlencoded'}
-        normalized = \
-            HmacSha1Signature()._normalize_request_parameters(self.request)
-        self.assertEqual('a=b&foo=bar',  normalized)
-
-    def test_normalize_request_parameters_data_string(self):
-        # params is a dict but data is a string
-        self.request.params = {'a': 'b'}
-        self.request.data = urlencode({'foo': 'bar'})
-        self.request.headers = \
-            {'Content-Type': 'application/x-www-form-urlencoded'}
-        normalized = \
-            HmacSha1Signature()._normalize_request_parameters(self.request)
-        self.assertEqual('a=b&foo=bar',  normalized)
+        self.assertNotIn('+', normalized)
 
     def test_normalize_request_parameters_whitespace(self):
-        self.request.data = dict(foo='bar baz')
-        self.request.headers = \
-            {'Content-Type': 'application/x-www-form-urlencoded'}
-        sig = HmacSha1Signature()._normalize_request_parameters(self.request)
-        self.assertEqual('foo=bar%20baz', sig)
+        req_kwargs = {'data': {'foo': 'bar baz'},
+                      'headers': {'Content-Type': FORM_URLENCODED}}
+        normalized = HmacSha1Signature()\
+            ._normalize_request_parameters(self.oauth_params, req_kwargs)
+        self.assertEqual('foo=bar%20baz', normalized)
 
-        # as a POST
-        self.request.method = 'POST'
-        self.request.data = dict(foo='bar baz')
-        self.request.headers = \
-            {'Content-Type': 'application/x-www-form-urlencoded'}
-        sig = HmacSha1Signature()._normalize_request_parameters(self.request)
-        self.assertEqual('foo=bar%20baz', sig)
+    def test_normalize_request_parameters_tilde(self):
+        req_kwargs = {'data': {'foo': 'bar~'},
+                      'headers': {'Content-Type': FORM_URLENCODED}}
+        normalized = HmacSha1Signature()\
+            ._normalize_request_parameters(self.oauth_params, req_kwargs)
+        self.assertEqual('foo=bar~', normalized)
 
-    def test_utf8_encoded_string(self):
+    def test_sign_utf8_encoded_string(self):
         # in the event a string is already UTF-8
-        self.request.params = {u'foo': u'bar'}
-        self.request.url = u'http://example.com/'
-        HmacSha1Signature().sign(self.request, self.hook.consumer_key)
-        self.assertEqual({'foo': 'bar'},  self.request.params)
+        req_kwargs = {u'params': {u'foo': u'bar'}}
+        sig = HmacSha1Signature().sign(self.consumer_secret,
+                                       self.access_token_secret,
+                                       u'GET',
+                                       self.url,
+                                       self.oauth_params,
+                                       req_kwargs)
+        self.assertEqual('cYzjVXCOk62KoYmJ+iCvcAcgfp8=',  sig)
+
+    def test_sign_with_data(self):
+        # in the event a string is already UTF-8
+        req_kwargs = {'data': {'foo': 'bar'}}
+        method = 'POST'
+        sig = HmacSha1Signature().sign(self.consumer_secret,
+                                       self.access_token_secret,
+                                       method,
+                                       self.url,
+                                       self.oauth_params,
+                                       req_kwargs)
+        self.assertEqual('JzmJUmqjdNYBJsJWbtQKXnc0W8w=',  sig)
 
     def test_remove_query_string(self):
         # can't sign the URL with the query string so
@@ -151,25 +133,115 @@ class OAuthTestHmacSha1Case(RauthTestCase):
     def test_normalize_request_parameters_data_not_urlencoded(self):
         # not sending the 'application/x-www-form-urlencoded' header
         # therefore the data will not be included in the signature
-        self.request.params_and_data = {}
-        self.request.data = {'foo': 'bar'}
-        normalized = \
-            HmacSha1Signature()._normalize_request_parameters(self.request)
+        req_kwargs = {'data': {'foo': 'bar'}}
+        normalized = HmacSha1Signature()\
+            ._normalize_request_parameters(self.oauth_params, req_kwargs)
         self.assertEqual('',  normalized)
 
-        self.request.params_and_data = {}
-        self.request.params = {'a': 'b'}
-        self.request.data = {'foo': 'bar'}
-        normalized = \
-            HmacSha1Signature()._normalize_request_parameters(self.request)
+        req_kwargs = {'params': {'a': 'b'}, 'data': {'foo': 'bar'}}
+        normalized = HmacSha1Signature()\
+            ._normalize_request_parameters({}, req_kwargs)
         self.assertEqual('a=b',  normalized)
+
+    def test_normalize_request_parameters_data_not_alphanumeric(self):
+        # data is not alphanumeric (for example: Japanese)
+        try:
+            from urllib import unquote
+        except ImportError:
+            from urllib.parse import unquote
+
+        # unicode
+        req_kwargs = {u'params': {u'foo': u'こんにちは世界'}}
+        normalized = HmacSha1Signature()\
+            ._normalize_request_parameters({}, req_kwargs)
+
+        key, value = normalized.split('=')
+        decoded_value = unquote(value)
+        self.assertEqual('こんにちは世界', unquote(decoded_value))
+
+        # str
+        req_kwargs = {'params': {'foo': 'こんにちは世界'}}
+        normalized = HmacSha1Signature()\
+            ._normalize_request_parameters({}, req_kwargs)
+
+        key, value = normalized.split('=')
+        decoded_value = unquote(value)
+        self.assertEqual('こんにちは世界', unquote(decoded_value))
 
 
 class OAuthTestRsaSha1Case(RauthTestCase):
-    def test_rsasha1_notimplemented(self):
-        self.assertRaises(NotImplementedError, RsaSha1Signature)
+    private_key = '''-----BEGIN RSA PRIVATE KEY-----
+        MIICXQIBAAKBgQDf0jdU+07T1B9erQBNS46JmvO7vsNfdNXkoEx4UwLwqsmv1wKs
+        RvCXBVyNYnnHYVQjSDRgyviNLYSP01DXqmwKlhSN9sbjiCeswXlG2B4BdFdO687J
+        9ZOmeyZsb6OFlXWediqkfvDaArSPM884YB2A8rqJd2y8Hd4tSG2Ns2o7WwIDAQAB
+        AoGBAMJ8FO54LMfuU4/d/hwsImA5z759BaGFkXLHQ4tufmiHzxdHWqA+SELCOujz
+        /+ObFBRQYosU86MhQUYElgPAp31u6MfmNc7nPvtuy1rSYVYD05oUqeyKBCycZa9r
+        F9+5ASNdvYF/vvAj5gQ2aOZPGsTf80hrUIDt2ebJn1yq3R1BAkEA49qUpQbKHDdJ
+        I9CZiiptySClyxyR3++oPw1UR9vfTz0qkzExYeS59TROX+sVpcpp/LFeTV8HeDVl
+        nUEv3xtEYQJBAPt4HDw21gRqL0W3V7xQIrCBnzttBA83y3hUpn1wRelJnnVsAUwv
+        KtxFZPSTprDFf3eTJP5vWEYcM4CME7L0GTsCQDAg1HMDOx+4oc9Z2YSwr53jMoHz
+        l/B4O86Nrza6f7HKFrsekfK+kHT1xnRGQL1TQw3oHSY0o2xFwx/zS/xRUyECQQDA
+        k/ojjucVWHA9Vqwk9cWrIIleDB2YveTfkQwzciDICG4GhKD1xAVxzN8EgnKcW5ND
+        cndZNtIGVyCF6EBJwq/zAkBjcXFUJMXXYiIzIpKJD2ZEMms2PXBkB0OxG+Yr0r4G
+        /w3QafaS0cyRCu0z0fY52+wcn5VrHk97sLQhLMQv07ij
+        -----END RSA PRIVATE KEY-----'''
+    method = 'GET'
+    url = 'http://example.com/'
+    oauth_params = {}
+    req_kwargs = {'params': {'foo': 'bar'}}
+
+    def test_rsasha1_signature(self):
+        oauth_signature = RsaSha1Signature().sign(self.private_key,
+                                                  None,
+                                                  self.method,
+                                                  self.url,
+                                                  self.oauth_params,
+                                                  self.req_kwargs)
+        self.assertIsNotNone(oauth_signature)
+        self.assertIsInstance(oauth_signature, stringtype)
+        self.assertEqual(oauth_signature,
+                         'MEnbOKBw0lWi5NvGyrABQ6tPygWiNOjGz47y8d+SQfXYrzsvK'
+                         'kzcMgt2VGBRgKsKSdFho36TuCuP75Qe1uou6/rhHrZoSppQ+6'
+                         'vdPSKkriGzSK3azqBacg9ZIIVy/atHPTm6BAvo+0v4ysiI9ci'
+                         '7hJbRkXL0NJVz/p0ZQKO/Jds=')
+
+    def test_rsasha1_badargument(self):
+        self.assertRaises(ValueError, RsaSha1Signature().sign,
+                          None, None,
+                          self.method,
+                          self.url,
+                          self.oauth_params,
+                          self.req_kwargs)
 
 
 class OAuthTestPlaintextCase(RauthTestCase):
-    def test_plaintext_notimplemented(self):
-        self.assertRaises(NotImplementedError, PlaintextSignature)
+    consumer_secret = '1234'
+    access_token_secret = 'abcdef'
+    method = 'GET'
+    url = 'http://example.com/'
+    oauth_params = {}
+    req_kwargs = {'params': {'foo': 'bar'}}
+
+    def test_plaintext_signature(self):
+        oauth_signature = PlaintextSignature().sign(self.consumer_secret,
+                                                    self.access_token_secret,
+                                                    self.method,
+                                                    self.url,
+                                                    self.oauth_params,
+                                                    self.req_kwargs)
+        self.assertIsNotNone(oauth_signature)
+        self.assertIsInstance(oauth_signature, stringtype)
+        sig = ('&'.join((self.consumer_secret, self.access_token_secret)))
+        self.assertEqual(sig, oauth_signature)
+
+    def test_no_token_secret_signature(self):
+        oauth_signature = PlaintextSignature().sign(self.consumer_secret,
+                                                    None,
+                                                    self.method,
+                                                    self.url,
+                                                    self.oauth_params,
+                                                    self.req_kwargs)
+        self.assertIsNotNone(oauth_signature)
+        self.assertIsInstance(oauth_signature, stringtype)
+        sig = ('&'.join((self.consumer_secret, '')))
+        self.assertEqual(sig, oauth_signature)

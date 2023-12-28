@@ -41,7 +41,7 @@ master_doc = 'index'
 
 # General information about the project.
 project = u'rauth'
-copyright = u'2012, Litl'
+copyright = u'2013, Litl'
 
 # The version info for the project you're documenting, acts as replacement for
 # |version| and |release|, also used in various other places throughout the
@@ -101,7 +101,7 @@ html_theme_options = {'github_fork': 'litl/rauth', 'index_logo': False}
 
 # The theme to use for HTML and HTML Help pages.  See the documentation for
 # a list of builtin themes.
-html_theme = 'flask_small'
+html_theme = 'flask'
 
 
 # Add any paths that contain custom themes here, relative to this directory.
@@ -233,9 +233,13 @@ man_pages = [
 # (source start file, target name, title, author,
 #  dir menu entry, description, category)
 texinfo_documents = [
-    ('index', 'rauth', u'rauth Documentation',
-        u'Max Countryman', 'Rauth', 'One line description of project.',
-        'Miscellaneous'),
+    ('index',
+     'rauth',
+     u'rauth Documentation',
+     u'Max Countryman',
+     'Rauth',
+     'A simple Python OAuth 1.0/a, OAuth 2.0, and Ofly consumer library built on top of Requests.',
+     'Miscellaneous')
 ]
 
 # Documents to append as an appendix to all manuals.

@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 '''
     rauth.service
     -------------
@@ -5,400 +6,57 @@
     Provides OAuth 1.0/a, 2.0 and Ofly service containers.
 '''
 
-import requests
-import json
-import hashlib
+from rauth.compat import urlencode
+from rauth.session import OAuth1Session, OAuth2Session, OflySession
+from rauth.utils import ENTITY_METHODS, parse_utf8_qsl
 
-from rauth.hook import OAuth1Hook
-
-from urllib import quote, urlencode
-from urlparse import parse_qsl, urlsplit
-from datetime import datetime
-
-DEFAULT_TIMEOUT = 300
+PROCESS_TOKEN_ERROR = ('Decoder failed to handle {key} with data as returned '
+                       'by provider. A different decoder may be needed. '
+                       'Provider returned: {raw}')
 
 
-def parse_utf8_qsl(s):
-    d = dict(parse_qsl(s))
-
-    for k, v in d.items():
-        if isinstance(k, unicode) and isinstance(v, unicode):
-            # skip this iteration if we have no keys or values to update
-            continue
-        d.pop(k)
-        if not isinstance(k, unicode):
-            k = unicode(k, 'utf-8')
-        if not isinstance(v, unicode):
-            v = unicode(v, 'utf-8')
-        d[k] = v
-    return d
+def process_token_request(r, decoder, *args):
+    try:
+        data = decoder(r.content)
+        return tuple(data[key] for key in args)
+    except KeyError as e:  # pragma: no cover
+        bad_key = e.args[0]
+        raise KeyError(PROCESS_TOKEN_ERROR.format(key=bad_key, raw=r.content))
 
 
-def is_absolute_url(url):
-    return url.startswith(('http://', 'https://'))
+class Service(object):
+    __attrs__ = ['name', 'base_url', 'authorize_url']
 
-
-class Request(object):
-    '''A container for common HTTP request methods.'''
-    def get(self, url, **kwargs):
-        '''Sends a GET request. Returns :class:`Response` object.
-
-        :param url: The resource to be requested.
-        :param \*\*kwargs: Optional arguments that ``request`` takes.
-        '''
-        return self.request('GET', url, **kwargs)
-
-    def post(self, url, **kwargs):
-        '''Sends a POST request. Returns :class:`Response` object.
-
-        :param url: The resource to be requested.
-        :param \*\*kwargs: Optional arguments that ``request`` takes.
-        '''
-        return self.request('POST', url, **kwargs)
-
-    def put(self, url, **kwargs):
-        '''Sends a PUT request. Returns :class:`Response` object.
-
-        :param url: The resource to be requested.
-        :param \*\*kwargs: Optional arguments that ``request`` takes.
-        '''
-        return self.request('PUT', url, **kwargs)
-
-    def delete(self, url, **kwargs):
-        '''Sends a DELETE request. Returns :class:`Response` object.
-
-        :param url: The resource to be requested.
-        :param \*\*kwargs: Optional arguments that ``request`` takes.
-        '''
-        return self.request('DELETE', url, **kwargs)
-
-
-class Response(object):
-    '''A service response container.
-
-    :param content: The parsed response.content else unparsed.
-    :param response: The unaltered response object from Requests.
-    '''
-    def __init__(self, response):
-        self.response = response
-
-    @property
-    def content(self):
-        # NOTE: it would be nice to use content-type here however we can't
-        # trust services to be honest with this header so for now the
-        # following is more robust and less prone to fragility when the header
-        # isn't set properly
-        if isinstance(self.response.content, basestring):
-            try:
-                content = json.loads(self.response.content)
-            except ValueError:
-                content = parse_utf8_qsl(self.response.content)
-        else:
-            content = self.response.content
-        return content
-
-
-class Service(Request):
-    def __init__(self, name, base_url, authorize_url, **kwargs):
-        # the service name, e.g. 'twitter'
+    def __init__(self, name, base_url, authorize_url):
+        #: The service name, e.g. 'twitter'.
         self.name = name
 
-        # the base URL used for making API requests
+        #: The base URL used for making API requests.
         self.base_url = base_url
 
-        # the authorization URL
+        #: The authorization URL.
         self.authorize_url = authorize_url
 
-        self.__dict__.update(**kwargs)
+    def __getstate__(self):
+        return dict((attr, getattr(self, attr, None)) for
+                    attr in self.__attrs__)
 
-
-class OflyService(Service):
-    '''An Ofly Service container.
-
-    This class wraps an Ofly service. Most commonly, Shutterfly. The process
-    is similar to that of OAuth 1.0 but simplified. Here we use Requests
-    directly rather than relying on a hook.
-
-    You might intialize :class:`OflyService` something like this::
-
-        service = OflyService(name='example',
-                              consumer_key='123',
-                              consumer_secret='456',
-                              authorize_url='http://example.com/authorize')
-
-    A signed authorize URL is then produced via calling
-    `service.get_authorize_url`. Once this has been visited by the client and
-    assuming the client authorizes the request, subsequent API calls may be
-    made through `service.request`.
-
-    .. admonition:: Additional Signing Options
-
-        The signing process here only supports SHA1 although the specification
-        allows for RSA1 as well. This could be implemented in the future. For
-        more information please see:
-        http://www.shutterfly.com/documentation/OflyCallSignature.sfly
-
-    :param consumer_key: Client consumer key.
-    :param consumer_secret: Client consumer secret.
-    :param name: The service name, defaults to None.
-    :param authorize_url: Authorize endpoint, defaults to None.
-    '''
-    TIMESTAMP_FORMAT = '%Y-%m-%dT%H:%M:%S.{0}Z'
-    MICRO_MILLISECONDS_DELTA = 1000
-
-    def __init__(self, consumer_key, consumer_secret, name=None,
-                 authorize_url=None, base_url=None):
-        self.consumer_key = consumer_key
-        self.consumer_secret = consumer_secret
-
-        # wrap requests in a Requests session
-        self.session = requests.session()
-
-        super(OflyService, self).__init__(name,
-                                          base_url,
-                                          authorize_url)
-
-    def _micro_to_milliseconds(self, microseconds):
-        return microseconds / self.MICRO_MILLISECONDS_DELTA
-
-    def _sort_params(self, params):
-        def sorting():
-            for k in sorted(params.keys()):
-                yield '='.join((k, params[k]))
-        return '&'.join(sorting())
-
-    def _sha1_sign_params(self, url, header_auth=False, **params):
-        now = datetime.utcnow()
-        milliseconds = self._micro_to_milliseconds(now.microsecond)
-        time_format = self.TIMESTAMP_FORMAT.format(milliseconds)
-        ofly_params = {'oflyAppId': self.consumer_key,
-                       'oflyHashMeth': 'SHA1',
-                       'oflyTimestamp': now.strftime(time_format)}
-
-        # select only the path for signing
-        url_path = urlsplit(url).path
-
-        signature_base_string = \
-            self.consumer_secret \
-            + url_path \
-            + '?'
-
-        # only append params if there are any, to avoid a leading ampersand
-        sorted_params = self._sort_params(params)
-        if len(sorted_params) > 0:
-            signature_base_string += sorted_params + '&'
-
-        signature_base_string += self._sort_params(ofly_params)
-
-        params['oflyApiSig'] = hashlib.sha1(signature_base_string).hexdigest()
-
-        if not header_auth:
-            # don't use header authentication
-            params = dict(params.items() + ofly_params.items())
-            return self._sort_params(params)
-
-        # return the raw ofly_params for use in the header
-        return self._sort_params(params), ofly_params
-
-    def get_authorize_url(self, remote_user=None, redirect_uri=None, **params):
-        '''Returns a proper authorize URL.
-
-        :param remote_user: This is the oflyRemoteUser param. Defaults to None.
-        :param redirect_uri: This is the oflyCallbackUrl. Defaults to None.
-        :param \*\*params: Additional keyworded arguments to be added to the
-            request querystring.
-        '''
-        if remote_user is not None:
-            params.update({'oflyRemoteUser': remote_user})
-
-        if redirect_uri is not None:
-            params.update({'oflyCallbackUrl': redirect_uri})
-
-        params = '?' + self._sha1_sign_params(self.authorize_url, **params)
-        return self.authorize_url + params
-
-    def request(self, method, uri, **kwargs):
-        '''Sends a request to an Ofly endpoint, properly wrapped around
-        requests.
-
-        :param method: A string representation of the HTTP method to be
-            used.
-        :param url: The resource to be requested.
-        :param header_auth: Authenication via header, defaults to False.
-        :param \*\*kwargs: Optional arguments. Same as Requests.
-        '''
-        params = kwargs.pop('params', None)
-        data = kwargs.pop('data', None)
-
-        if params is None:
-            params = {}
-
-        kwargs['timeout'] = kwargs.get('timeout', DEFAULT_TIMEOUT)
-
-        if self.base_url is not None and not is_absolute_url(uri):
-            uri = self.base_url + uri
-
-        header_auth = kwargs.pop('header_auth', False)
-        if header_auth:
-            params, headers = self._sha1_sign_params(uri,
-                                                     header_auth,
-                                                     **params)
-
-            response = self.session.request(method,
-                                            uri + '?' + params,
-                                            headers=headers,
-                                            **kwargs)
-        else:
-            params = self._sha1_sign_params(uri, **params)
-
-            response = self.session.request(method,
-                                            uri + '?' + params,
-                                            data=data,
-                                            **kwargs)
-
-        return Response(response)
-
-
-class OAuth2Service(Service):
-    '''An OAuth 2.0 Service container.
-
-    This class is similar in nature to the OAuth1Service container but does
-    not make use of a request hook. Instead the OAuth 2.0 spec is currently
-    simple enough that we can wrap it around requests directly.
-
-    You might intialize :class:`OAuth2Service` something like this::
-
-        service = OAuth2Service(
-                   name='example',
-                   consumer_key='123',
-                   consumer_secret='456',
-                   access_token_url='http://example.com/token',
-                   authorize_url='http://example.com/authorize')
-
-    Given the simplicity of OAuth 2.0 now this object `service` can be used to
-    retrieve an access token in two steps::
-
-        # the return URL is used to validate the request
-        url = service.get_authorize_url(redirect_uri='http://example.com/',
-                                        response_type='code')
-
-        # once the above URL is consumed by a client we can ask for an access
-        # token. note that the code is retrieved from the redirect URL above,
-        # as set by the provider
-        data = dict(code='foobar',
-                    grant_type='authorization_code',
-                    redirect_uri='http://example.com/')
-        token = service.get_access_token('POST', data=data)
-
-    :param client_id: Client consumer key.
-    :param client_secret: Client consumer secret.
-    :param name: The service name, defaults to None.
-    :param access_token_url: Access token endpoint, defaults to None.
-    :param authorize_url: Authorize endpoint, defaults to None.
-    :param access_token: An access token, defaults to None.
-    '''
-    def __init__(self, client_id=None, client_secret=None, name=None,
-                 access_token_url=None, authorize_url=None, access_token=None,
-                 base_url=None, **kwargs):
-        self.client_id = client_id or kwargs.get('consumer_key')
-        self.client_secret = client_secret or kwargs.get('consumer_secret')
-
-        # DEPRECATED: these are superceded by client_id and client_secret
-        self.consumer_key = kwargs.get('consumer_key', client_id)
-        self.consumer_secret = kwargs.get('consumer_secret', client_secret)
-
-        if None in (self.consumer_key, self.consumer_secret):
-            raise ValueError('client_id and client_secret must not be None')
-
-        self.access_token_url = access_token_url
-
-        self.access_token = None
-        if access_token is not None:
-            self.access_token = access_token
-
-        self.session = requests.session()
-
-        super(OAuth2Service, self).__init__(name,
-                                            base_url,
-                                            authorize_url,
-                                            access_token=access_token)
-
-    def get_authorize_url(self, response_type='code', **params):
-        '''Returns a proper authorize URL.
-
-        :param reponse_type: The response type. Defaults to 'code'.
-        :param \*\*params: Additional keyworded arguments to be added to the
-            request querystring.
-        '''
-        params.update({'client_id': self.consumer_key,
-                       'response_type': response_type})
-        params = '?' + urlencode(params)
-        return self.authorize_url + params
-
-    def get_access_token(self, method='POST', **kwargs):
-        '''Retrieves the access token.
-
-        :param method: A string representation of the HTTP method to be used.
-            Defaults to 'POST'.
-        :param grant_type: The grant type. Deaults to 'authorization_code'.
-        :param \*\*kwargs: Optional arguments. Same as Requests.
-        '''
-        # populate either data or params with our credentials
-        key = None
-        if 'data' in kwargs:
-            key = 'data'
-        elif 'params' in kwargs:
-            key = 'params'
-        else:
-            # raise an error because credentials must be sent in this method
-            raise ValueError('Either params or data dict missing.')
-
-        grant_type = kwargs[key].get('grant_type', 'authorization_code')
-
-        # client_credentials flow uses basic authentication for a token
-        if grant_type == 'client_credentials':
-            kwargs['auth'] = (self.consumer_key, self.consumer_secret)
-        else:
-            kwargs[key].update(client_id=self.consumer_key,
-                               client_secret=self.consumer_secret,
-                               grant_type=grant_type)
-
-        response = self.session.request(method,
-                                        self.access_token_url,
-                                        **kwargs)
-
-        return Response(response)
-
-    def request(self, method, uri, use_stored_token=True, **kwargs):
-        '''Sends a request to an OAuth 2.0 endpoint, properly wrapped around
-        requests.
-
-        :param method: A string representation of the HTTP method to be used.
-        :param uri: The resource to be requested.
-        :param \*\*kwargs: Optional arguments. Same as Requests.
-        '''
-        # see if we can prepend base_url
-        if self.base_url is not None and not is_absolute_url(uri):
-            uri = self.base_url + uri
-
-        # see if we can use a stored access_token
-        if self.access_token is not None and use_stored_token:
-            kwargs['params'].update(access_token=self.access_token)
-
-        kwargs['timeout'] = kwargs.get('timeout', DEFAULT_TIMEOUT)
-        response = self.session.request(method, uri, **kwargs)
-        return Response(response)
+    def __setstate__(self, state):
+        for attr, value in state.items():
+            setattr(self, attr, value)
 
 
 class OAuth1Service(Service):
-    '''An OAuth 1.0/a Service container.
+    '''
+    An OAuth 1.0/a Service container.
 
-    This class provides a container for an OAuth Service provider. It utilizes
-    the OAuthHook object which in turn is hooked into Python Requests. This
-    object can be used to streamline the process of authenticating with and
-    using an OAuth 1.0/a service provider.
+    This class provides a wrapper around a specialized Requests'
+    :class:`~requests.sessions.Session` object. Primarily this wrapper is used
+    to produce authenticated session objects. These may be used to make
+    requests against OAuth 1.0/a endpoints.
 
-    You might intialize :class:`OAuth1Service` something like this::
+    You might intialize :class:`OAuth1Service` something like
+    this::
 
         service = OAuth1Service(
                    name='example',
@@ -406,219 +64,611 @@ class OAuth1Service(Service):
                    consumer_secret='456',
                    request_token_url='http://example.com/request_token',
                    access_token_url='http://example.com/access_token',
-                   authorize_url='http://example.com/authorize')
+                   authorize_url='http://example.com/authorize',
+                   base_url='http://example.com/api')
 
     Now the request token should be retrieved::
 
         request_token, request_token_secret = service.get_request_token()
 
-    At this point it is usually necessary to redirect the client to the
-    authorize URI. This URI is retrieved as follows::
+    .. admonition:: Differing Request Token Formats
+
+        Some services provide different formatting when returning tokens. For
+        this reason the service wrapper provides a special method
+        :meth:`get_raw_request_token`. This will return the unparsed response.
+        At this point it's up to you to extract the necessary data.
+
+    It's time to access the authorize URI and direct the client to authorize
+    requests on their behalf. This URI is retrieved as follows::
 
         authorize_url = service.get_authorize_url(request_token)
 
     Once the client has authorized the request it is now possible to retrieve
     an access token. Do so as follows::
 
-        response = \
-            service.get_access_token(method='GET'
-                                     request_token=request_token,
-                                     request_token_secret=request_token_secret)
+        session = service.get_auth_session(request_token, request_token_secret)
 
-        # access tokens are returned in the response.content dictionary
-        response.content['oauth_token']
-        response.content['oauth_key']
+    .. admonition:: Differing Access Token Formats
 
-    Finally the :class:`get_authenticated_session` method returns a wrapped
-    session and can be used once the access token has been made available.
-    This provides simple access to the providers endpoints.
+        Some services provide different formatting when returning tokens. For
+        this reason the service wrapper provides a special method
+        :meth:`get_raw_access_token`. This will return the unparsed response.
+        At this point it's up to you to extract the necessary data.
 
-    :param name: The service name, defaults to None.
+    Finally we have an authenticated session and are ready to make requests
+    against OAuth 1.0/a endpoints. Because Rauth is a wrapper around
+    Requests, the same API you would use with Requests is exposed and
+    expected::
+
+        r = session.get('some/resource/', params={'format': 'json'})
+        print r.json()
+
     :param consumer_key: Client consumer key, required for signing.
+    :type consumer_key: str
     :param consumer_secret: Client consumer secret, required for signing.
-    :param request_token_url: Request token endpoint, defaults to None.
-    :param access_token_url: Access token endpoint, defaults to None.
-    :param authorize_url: Authorize endpoint, defaults to None.
-    :param header_auth: Authenication via header, defaults to False.
+    :type consumer_secret: str
+    :param name: The service name, defaults to `None`.
+    :type name: str
+    :param request_token_url: Request token endpoint, defaults to `None`.
+    :type request_token_url: str
+    :param access_token_url: Access token endpoint, defaults to `None`.
+    :type access_token_url: str
+    :param authorize_url: Authorize endpoint, defaults to `None`.
+    :type authorize_url: str
+    :param base_url: A base URL from which to construct requests, defaults to
+        `None`.
+    :type base_url: str
+    :param session_obj: Object used to construct sessions with, defaults to
+        :class:`rauth.OAuth1Session <OAuth1Session>`
+    :type session_obj: :class:`Session`
+    :param signature_obj: Object used to construct signatures with, defaults
+         to :class:`rauth.oauth.HmacSha1Signature <HmacSha1Signature>`
+    :type signature_obj: :class:`SignatureMethod`
     '''
-    def __init__(self, consumer_key, consumer_secret, name=None,
-                 request_token_url=None, access_token_url=None,
-                 authorize_url=None, header_auth=False, base_url=None,
-                 access_token=None, access_token_secret=None):
+    __attrs__ = Service.__attrs__ + ['consumer_key',
+                                     'consumer_secret',
+                                     'request_token_url',
+                                     'access_token_url',
+                                     'session_obj']
+
+    def __init__(self,
+                 consumer_key,
+                 consumer_secret,
+                 name=None,
+                 request_token_url=None,
+                 access_token_url=None,
+                 authorize_url=None,
+                 base_url=None,
+                 session_obj=None,
+                 signature_obj=None):
+
+        #: Client credentials.
         self.consumer_key = consumer_key
         self.consumer_secret = consumer_secret
 
-        # authorization endpoints
+        #: Authorization endpoints.
         self.request_token_url = request_token_url
         self.access_token_url = access_token_url
 
-        # set to True to use header authentication for this service
-        self.header_auth = header_auth
+        #: Object used to construct sessions with.
+        self.session_obj = session_obj or OAuth1Session
 
-        params = dict(access_token=access_token,
-                      access_token_secret=access_token_secret)
+        #: Object used to construct signatures with.
+        self.signature_obj = signature_obj
+
+        #: Request and access token responses.
+        self.request_token_response = None
+        self.access_token_response = None
 
         super(OAuth1Service, self).__init__(name,
                                             base_url,
-                                            authorize_url,
-                                            **params)
+                                            authorize_url)
 
-    def _construct_session(self, **kwargs):
-        '''Construct the request session, supplying the consumer key and
-        secret.
-
-        :param \*\*kwargs: Extra keyworded arguments to be passed to the
-            OAuth1Hook constructor.
+    def get_session(self, token=None, signature=None):
         '''
-        hook = OAuth1Hook(consumer_key=self.consumer_key,
-                          consumer_secret=self.consumer_secret,
-                          **kwargs)
-        return requests.session(hooks={'pre_request': hook})
+        If provided a `token` parameter, tries to retrieve a stored
+        `rauth.OAuth1Session` instance. Otherwise generates a new session
+        instance with the :class:`rauth.OAuth1Service.consumer_key` and
+        :class:`rauth.OAuth1Service.consumer_secret` stored on the
+        `rauth.OAuth1Service` instance.
 
-    def get_raw_request_token(self, method='GET', oauth_callback='oob',
-                              **kwargs):
-        '''Gets a response from the request token endpoint.
+        :param token: A tuple of strings with which to memoize the session
+            object instance.
+        :type token: tuple
+        '''
+        if token is not None:
+            access_token, access_token_secret = token
+            session = self.session_obj(self.consumer_key,
+                                       self.consumer_secret,
+                                       access_token,
+                                       access_token_secret,
+                                       signature or self.signature_obj,
+                                       service=self)
+        else:  # pragma: no cover
+            signature = signature or self.signature_obj
+            session = self.session_obj(self.consumer_key,
+                                       self.consumer_secret,
+                                       signature=signature,
+                                       service=self)
+        return session
 
-        Returns the entire parsed response, without trying to pull out the
-        token and secret.  Use this if your endpoint doesn't use the usual
-        names for 'oauth_token' and 'oauth_token_secret'.
+    def get_raw_request_token(self, method='GET', **kwargs):
+        '''
+        Returns a Requests' response over the
+        :attr:`rauth.OAuth1Service.request_token_url`.
 
-        :param method: A string representation of the HTTP method to be used.
+        Use this if your endpoint if you need the full `Response` object.
+
+        :param method: A string representation of the HTTP method to be used,
+            defaults to `GET`.
+        :type method: str
         :param \*\*kwargs: Optional arguments. Same as Requests.
+        :type \*\*kwargs: dict
         '''
         # ensure we've set the request_token_url
         if self.request_token_url is None:
-            raise ValueError('request_token_url must not be None')
+            raise TypeError('request_token_url must not be None')
 
-        auth_session = \
-            self._construct_session(header_auth=self.header_auth,
-                                    default_oauth_callback=oauth_callback)
+        session = self.get_session()
+        self.request_token_response = session.request(method,
+                                                      self.request_token_url,
+                                                      **kwargs)
+        return self.request_token_response
 
-        response = auth_session.request(method,
-                                        self.request_token_url,
-                                        **kwargs)
-
-        # TODO: use the following instead
-        #if not response.ok:
-        #    return response.content
-
-        response.raise_for_status()
-
-        return parse_utf8_qsl(response.content)
-
-    def get_request_token(self, method='GET', **kwargs):
-        '''Gets a request token from the request token endpoint.
-
-        :param method: A string representation of the HTTP method to be used.
-        :param \*\*kwargs: Optional arguments. Same as Requests.
+    def get_request_token(self,
+                          method='GET',
+                          decoder=parse_utf8_qsl,
+                          key_token='oauth_token',
+                          key_token_secret='oauth_token_secret',
+                          **kwargs):
         '''
-        data = self.get_raw_request_token(method=method, **kwargs)
-        return data['oauth_token'], data['oauth_token_secret']
+        Return a request token pair.
+
+        :param method: A string representation of the HTTP method to be used,
+            defaults to `GET`.
+        :type method: str
+        :param decoder: A function used to parse the Response content. Should
+            return a dictionary.
+        :type decoder: func
+        :param key_token: The key the access token will be decoded by, defaults
+            to 'oauth_token'.
+        :type string:
+        :param key_token_secret: The key the access token will be decoded by,
+            defaults to 'oauth_token_secret'.
+        :type string:
+        :param \*\*kwargs: Optional arguments. Same as Requests.
+        :type \*\*kwargs: dict
+        '''
+        r = self.get_raw_request_token(method=method, **kwargs)
+        request_token, request_token_secret = \
+            process_token_request(r, decoder, key_token, key_token_secret)
+        return request_token, request_token_secret
 
     def get_authorize_url(self, request_token, **params):
-        '''Returns a proper authorize URL.
+        '''
+        Returns a formatted authorize URL.
 
         :param request_token: The request token as returned by
             :class:`get_request_token`.
+        :type request_token: str
         :param \*\*params: Additional keyworded arguments to be added to the
             request querystring.
+        :type \*\*params: dict
         '''
-        params.update({'oauth_token': quote(request_token)})
-        params = '?' + urlencode(params)
-        return self.authorize_url + params
+        params.update({'oauth_token': request_token})
+        return self.authorize_url + '?' + urlencode(params)
 
-    def get_access_token(self, method='GET', **kwargs):
-        '''Retrieves the access token.
+    def get_raw_access_token(self,
+                             request_token,
+                             request_token_secret,
+                             method='GET',
+                             **kwargs):
+        '''
+        Returns a Requests' response over the
+        :attr:`rauth.OAuth1Service.access_token_url`.
 
-        :param method: A string representation of the HTTP method to be
-            used.
+        Use this if your endpoint if you need the full `Response` object.
+
         :param request_token: The request token as returned by
-            :class:`get_request_token`.
+            :meth:`get_request_token`.
+        :type request_token: str
         :param request_token_secret: The request token secret as returned by
-            :class:`get_request_token`.
+            :meth:`get_request_token`.
+        :type request_token_secret: str
+        :param method: A string representation of the HTTP method to be
+            used, defaults to `GET`.
+        :type method: str
         :param \*\*kwargs: Optional arguments. Same as Requests.
+        :type \*\*kwargs: dict
         '''
         # ensure we've set the access_token_url
         if self.access_token_url is None:
-            raise ValueError('access_token_url must not be None')
+            raise TypeError('access_token_url must not be None')
 
-        request_token = kwargs.pop('request_token')
-        request_token_secret = kwargs.pop('request_token_secret')
+        session = self.get_session((request_token, request_token_secret))
+        self.access_token_response = session.request(method,
+                                                     self.access_token_url,
+                                                     **kwargs)
+        return self.access_token_response
 
-        auth_session = \
-            self._construct_session(access_token=request_token,
-                                    access_token_secret=request_token_secret,
-                                    header_auth=self.header_auth)
-
-        response = auth_session.request(method,
-                                        self.access_token_url,
-                                        **kwargs)
-
-        return Response(response)
-
-    def get_authenticated_session(self, access_token, access_token_secret,
-                                  header_auth=False):
-        '''Returns an authenticated Requests session utilizing the hook.
-
-        :param access_token: The access token as returned by
-            :class:`get_access_token`
-        :param access_token_secret: The access token secret as returned by
-            :class:`get_access_token`
-        :param header_auth: Authenication via header, defaults to False.
+    def get_access_token(self,
+                         request_token,
+                         request_token_secret,
+                         method='GET',
+                         decoder=parse_utf8_qsl,
+                         key_token='oauth_token',
+                         key_token_secret='oauth_token_secret',
+                         **kwargs):
         '''
-        return self._construct_session(access_token=access_token,
-                                       access_token_secret=access_token_secret,
-                                       header_auth=header_auth)
+        Returns an access token pair.
 
-    def request(self, method, uri, use_stored_token=True, **kwargs):
-        '''Makes a request using :class:`_construct_session`.
-
+        :param request_token: The request token as returned by
+            :meth:`get_request_token`.
+        :type request_token: str
+        :param request_token_secret: The request token secret as returned by
+            :meth:`get_request_token`.
+        :type request_token_secret: str
         :param method: A string representation of the HTTP method to be
-            used.
-        :param uri: The resource to be requested.
-        :param access_token: The access token as returned by
-            :class:`get_access_token`.
-        :param access_token_secret: The access token secret as returned by
-            :class:`get_access_token`.
-        :param header_auth: Authenication via header, defaults to False.
-        :param allow_redirects: Allows a request to redirect, defaults to True.
+            used, defaults to `GET`.
+        :type method: str
+        :param decoder: A function used to parse the Response content. Should
+            return a dictionary.
+        :type decoder: func
+        :param key_token: The key the access token will be decoded by, defaults
+            to 'oauth_token'.
+        :type string:
+        :param key_token_secret: The key the access token will be decoded by,
+            defaults to 'oauth_token_secret'.
+        :type string:
         :param \*\*kwargs: Optional arguments. Same as Requests.
+        :type \*\*kwargs: dict
         '''
-        header_auth = kwargs.pop('header_auth', self.header_auth)
-        allow_redirects = kwargs.pop('allow_redirects', True)
+        r = self.get_raw_access_token(request_token,
+                                      request_token_secret,
+                                      method=method,
+                                      **kwargs)
 
-        kwargs['headers'] = kwargs.get('headers', {})
+        access_token, access_token_secret = \
+            process_token_request(r, decoder, key_token, key_token_secret)
+        return access_token, access_token_secret
 
-        # set a default request timeout
-        kwargs['timeout'] = kwargs.get('timeout', DEFAULT_TIMEOUT)
+    def get_auth_session(self,
+                         request_token,
+                         request_token_secret,
+                         method='GET',
+                         **kwargs):
+        '''
+        Gets an access token, intializes a new authenticated session with the
+        access token. Returns an instance of :attr:`session_obj`.
 
-        # set the Content-Type if unspecified
-        if method in ('POST', 'PUT'):
-            kwargs['headers']['Content-Type'] = \
-                kwargs['headers'].get('Content-Type',
-                                      'application/x-www-form-urlencoded')
+        :param request_token: The request token as returned by
+            :meth:`get_request_token`.
+        :type request_token: str
+        :param request_token_secret: The request token secret as returned by
+            :meth:`get_request_token`.
+        :type request_token_secret: str
+        :param method: A string representation of the HTTP method to be
+            used, defaults to `GET`.
+        :type method: str
+        :param \*\*kwargs: Optional arguments. Same as Requests.
+        :type \*\*kwargs: dict
+        '''
+        token = self.get_access_token(request_token,
+                                      request_token_secret,
+                                      method=method,
+                                      **kwargs)
+        session = self.get_session(token)
 
-        # prepend a base_url to the uri if we can
-        if self.base_url is not None and not is_absolute_url(uri):
-            uri = self.base_url + uri
+        if self.request_token_response:
+            session.request_token_response = self.request_token_response
+        if self.access_token_response:
+            session.access_token_response = self.access_token_response
 
-        # if we've got a non-None access token, use it
-        access_tokens = (self.access_token, self.access_token_secret)
-        if not None in access_tokens and use_stored_token:
-            access_token = self.access_token,
-            access_token_secret = self.access_token_secret
-        else:
-            access_token = kwargs.pop('access_token')
-            access_token_secret = kwargs.pop('access_token_secret')
+        return session
 
-        auth_session = \
-            self._construct_session(access_token=access_token,
-                                    access_token_secret=access_token_secret,
-                                    header_auth=header_auth)
 
-        response = auth_session.request(method,
-                                        uri,
-                                        allow_redirects=allow_redirects,
-                                        **kwargs)
+class OAuth2Service(Service):
+    '''
+    An OAuth 2.0 Service container.
 
-        return Response(response)
+    This class provides a wrapper around a specialized Requests'
+    :class:`~requests.session.Session` object. Primarily this wrapper is used
+    for producing authenticated session objects which are used to make requests
+    against OAuth 2.0 endpoints.
+
+    You might intialize :class:`OAuth2Service` something like this::
+
+        service = OAuth2Service(
+                   name='example',
+                   client_id='123',
+                   client_secret='456',
+                   access_token_url='https://example.com/token',
+                   authorize_url='https://example.com/authorize',
+                   base_url='https://example.com/api/')
+
+    Given the simplicity of OAuth 2.0 now this object `service` can be used to
+    retrieve an authenticated session in two simple steps::
+
+        # the return URL is used to validate the request
+        params = {'redirect_uri': 'http://example.com/',
+                  'response_type': 'code'}
+        url = service.get_authorize_url(**params)
+
+        # once the above URL is consumed by a client we can ask for an access
+        # token. note that the code is retrieved from the redirect URL above,
+        # as set by the provider
+        data = {'code': 'foobar',
+                'grant_type': 'authorization_code',
+                'redirect_uri': 'http://example.com/'}
+
+        session = service.get_auth_session(data=data)
+
+    Now that we have retrieved a session, we may make requests against the
+    OAuth 2.0 provider's endpoints. As much as possible the Requests' API
+    is preserved and you may make requests using the same parameters you would
+    using Requests::
+
+        r = session.get('foo', params={'format': 'json'})
+        print r.json()
+
+    :param client_id: Client id.
+    :type client_id: str
+    :param client_secret: Client secret.
+    :type client_secret: str
+    :param name: The service name, defaults to `None`.
+    :type name: str
+    :param access_token_url: Access token endpoint, defaults to `None`.
+    :type access_token_url: str
+    :param authorize_url: Authorize endpoint, defaults to `None`.
+    :type authorize_url: str
+    :param base_url: A base URL from which to construct requests, defaults to
+        `None`.
+    :type base_url: str
+    :param session_obj: Object used to construct sessions with, defaults to
+        :class:`OAuth2Session`
+    :type session_obj: :class:`rauth.Session`
+    '''
+    __attrs__ = Service.__attrs__ + ['client_id',
+                                     'client_secret',
+                                     'access_token_url',
+                                     'session_obj']
+
+    def __init__(self,
+                 client_id,
+                 client_secret,
+                 name=None,
+                 access_token_url=None,
+                 authorize_url=None,
+                 base_url=None,
+                 session_obj=None):
+
+        #: Client credentials.
+        self.client_id = client_id
+        self.client_secret = client_secret
+
+        #: The provider's access token URL.
+        self.access_token_url = access_token_url
+
+        #: Object used to construct sessions with.
+        self.session_obj = session_obj or OAuth2Session
+
+        #: Access token response.
+        self.access_token_response = None
+
+        super(OAuth2Service, self).__init__(name,
+                                            base_url,
+                                            authorize_url)
+
+    def get_session(self, token=None):
+        '''
+        If provided, the `token` parameter is used to initialize an
+        authenticated session, otherwise an unauthenticated session object is
+        generated. Returns an instance of :attr:`session_obj`..
+
+        :param token: A token with which to initilize the session.
+        :type token: str
+        '''
+        if token is not None:
+            session = self.session_obj(self.client_id,
+                                       self.client_secret,
+                                       token,
+                                       service=self)
+        else:  # pragma: no cover
+            session = self.session_obj(self.client_id,
+                                       self.client_secret,
+                                       service=self)
+        return session
+
+    def get_authorize_url(self, **params):
+        '''
+        Returns a formatted authorize URL.
+
+        :param \*\*params: Additional keyworded arguments to be added to the
+            URL querystring.
+        :type \*\*params: dict
+        '''
+
+        params.update({'client_id': self.client_id})
+        return self.authorize_url + '?' + urlencode(params)
+
+    def get_raw_access_token(self, method='POST', **kwargs):
+        '''
+        Returns a Requests' response over the
+        :attr:`OAuth2Service.access_token_url`.
+
+        Use this if your endpoint if you need the full `Response` object.
+
+        :param method: A string representation of the HTTP method to be used,
+            defaults to `POST`.
+        :type method: str
+        :param \*\*kwargs: Optional arguments. Same as Requests.
+        :type \*\*kwargs: dict
+        '''
+        key = 'params'
+        if method in ENTITY_METHODS:
+            key = 'data'
+
+        kwargs.setdefault(key, {})
+        kwargs[key].update({'client_id': self.client_id,
+                            'client_secret': self.client_secret})
+
+        session = self.get_session()
+        self.access_token_response = session.request(method,
+                                                     self.access_token_url,
+                                                     **kwargs)
+        return self.access_token_response
+
+    def get_access_token(self,
+                         method='POST',
+                         decoder=parse_utf8_qsl,
+                         key='access_token',
+                         **kwargs):
+        '''
+        Returns an access token.
+
+        :param method: A string representation of the HTTP method to be used,
+            defaults to `POST`.
+        :type method: str
+        :param decoder: A function used to parse the Response content. Should
+            return a dictionary.
+        :type decoder: func
+        :param key: The key the access token will be decoded by, defaults to
+            'access_token'.
+        :type string:
+        :param \*\*kwargs: Optional arguments. Same as Requests.
+        :type \*\*kwargs: dict
+        '''
+        r = self.get_raw_access_token(method, **kwargs)
+        access_token, = process_token_request(r, decoder, key)
+        return access_token
+
+    def get_auth_session(self, method='POST', **kwargs):
+        '''
+        Gets an access token, intializes a new authenticated session with the
+        access token. Returns an instance of :attr:`session_obj`.
+
+        :param method: A string representation of the HTTP method to be used,
+            defaults to `POST`.
+        :type method: str
+        :param \*\*kwargs: Optional arguments. Same as Requests.
+        :type \*\*kwargs: dict
+        '''
+        session = self.get_session(self.get_access_token(method, **kwargs))
+
+        if self.access_token_response:
+            session.access_token_response = self.access_token_response
+
+        return session
+
+
+class OflyService(Service):
+    '''
+    An Ofly Service container.
+
+    This class wraps an Ofly service i.e., Shutterfly. The process
+    is similar to that of OAuth 1.0 but simplified.
+
+    You might intialize :class:`OflyService` something like this::
+
+        service = OflyService(name='example',
+                              app_id='123',
+                              app_secret='456',
+                              authorize_url='http://example.com/authorize')
+
+    A signed authorize URL is then produced via calling
+    `service.get_authorize_url`. Once this has been visited by the client and
+    assuming the client authorizes the request.
+
+    Normal API calls can now be made using a session instance. Retrieve the
+    authenticated session like so::
+
+        session = service.get_auth_session('foo')
+
+        # now we can make regular Requests' calls
+        r = session.get('bar')
+
+    :param app_id: The oFlyAppId, i.e. "application ID".
+    :type app_id: str
+    :param app_secret: The oFlyAppSecret, i.e. "shared secret".
+    :type app_secret: str
+    :param name: The service name, defaults to `None`.
+    :type name: str
+    :param authorize_url: Authorize endpoint, defaults to `None`.
+    :type authorize_url: str
+    :param base_url: A base URL from which to construct requests, defaults to
+        `None`.
+    :type base_url: str
+    :param user_id: The oflyUserid, defaults to `None`. Note: this is required
+        for Ofly requests, retrieved via authorize URL.
+    :type user_id: str
+    :param session_obj: Object used to construct sessions with, defaults to
+        `rauth.OflySession`
+    :type session_obj: :class:`rauth.Session`
+    '''
+    __attrs__ = Service.__attrs__ + ['app_id',
+                                     'app_secret',
+                                     'user_id',
+                                     'session_obj']
+
+    def __init__(self,
+                 app_id,
+                 app_secret,
+                 name=None,
+                 authorize_url=None,
+                 base_url=None,
+                 user_id=None,
+                 session_obj=None):
+        #: Client credentials.
+        self.app_id = app_id
+        self.app_secret = app_secret
+
+        #: The oflyUserid.
+        self.user_id = user_id
+
+        #: Object used to construct sessions with.
+        self.session_obj = session_obj or OflySession
+
+        super(OflyService, self).__init__(name,
+                                          base_url,
+                                          authorize_url)
+
+    def get_session(self, token):
+        '''
+        The token parameter should be `oFlyUserid`. This is used to initialize
+        an authenticated session instance. Returns an instance of
+        :attr:`session_obj`.
+
+        :param token: A token with which to initialize the session with, e.g.
+            :attr:`OflyService.user_id`.
+        :type token: str
+        '''
+        return self.session_obj(self.app_id,
+                                self.app_secret,
+                                token,
+                                service=self)
+
+    def get_authorize_url(self, **params):
+        '''
+        Returns a formatted authorize URL.
+
+        :param \*\*params: Additional keyworded arguments to be added to the
+            request querystring.
+        :type \*\*params: dict
+        '''
+        params = self.session_obj.sign(self.authorize_url,
+                                       self.app_id,
+                                       self.app_secret,
+                                       **params)
+        return self.authorize_url + '?' + params
+
+    def get_auth_session(self, user_id, **kwargs):
+        '''
+        Intializes a new authenticated session with `user_id` as oFlyUserid.
+        Returns an instance of :attr:`session_obj`.
+
+        :param user_id: The oflyUserid, defaults to `None`.
+        :type user_id: str
+        :param \*\*kwargs: Optional arguments. Same as Requests.
+        :type \*\*kwargs: dict
+        '''
+        return self.get_session(user_id)
